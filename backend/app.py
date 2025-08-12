@@ -10,6 +10,10 @@ import json
 import time
 import sqlite3
 import asyncio
+from asyncio import gather
+from functools import cache
+from http.client import responses
+
 import aiohttp
 import socket
 from datetime import datetime
@@ -136,3 +140,113 @@ class Broadcaster:
             for s in stale:
                 if s in self._connections:
                     self._connections.remove(s)
+
+#GeoIP helper
+geo_reader=None
+if GEOIP_DB_PATH and geoip2_db:
+    try:
+        geo_reader=geoip2_db.Reader(GEOIP_DB_PATH)
+    except Exception:
+        geo_reader=None
+
+async def geo_lookup(ip:str)->Dict[str,any]:
+    if geo_reader:
+        try:
+            r = geo_reader.city(ip)
+            country = r.country.name or ""
+            city = r.city.name or ""
+            lat = getattr(r.location, "latitude", None)
+            lon = getattr(r.location, "longitude", None)
+            isp = ""  # MaxMind ASN DB needed for ASN/ISP, skip if not present
+            return {"country": country, "city": city, "lat": lat, "lon": lon, "org": isp}
+        except Exception:
+            pass
+
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,city,lat,lon,org,message"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=6) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("status") == "success":
+                        return {"country": data.get("country"), "city": data.get("city"),
+                                "lat": data.get("lat"), "lon": data.get("lon"), "org": data.get("org")}
+    except Exception:
+        pass
+
+    return {"country": None, "city": None, "lat": None, "lon": None, "org": None}
+
+#HTTP adapters for providers
+async def abuseipdb_check(ip: str) -> Dict[str, Any]:
+    """Return AbuseIPDB 'data' dict or error dict. Requires ABUSEIPDB_KEY env var."""
+    if not ABUSEIPDB_KEY:
+        return {"skipped": True, "reason": "no-abuseipdb-key"}
+    cached = cache.get("abuseipdb", ip)
+    if cached:
+        return {"cached": True, "data": cached}
+    url = "https://api.abuseipdb.com/api/v2/check"
+    headers = {"Key": ABUSEIPDB_KEY, "Accept": "application/json"}
+    params = {"ipAddress": ip, "maxAgeInDays": "90"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, params=params, timeout=15) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return {"error": f"http_{resp.status}", "body": text}
+                data = await resp.json()
+                d = data.get("data", data)
+                cache.set("abuseipdb", ip, d)
+                return {"data": d}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def virustotal_check(ip: str) -> Dict[str, Any]:
+    """Return VirusTotal v3 ip attributes or error dict. Requires VIRUSTOTAL_KEY env var."""
+    if not VIRUSTOTAL_KEY:
+        return {"skipped": True, "reason": "no-virustotal-key"}
+    cached = cache.get("virustotal", ip)
+    if cached:
+        return {"cached": True, "data": cached}
+    url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+    headers = {"x-apikey": VIRUSTOTAL_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return {"error": f"http_{resp.status}", "body": text}
+                data = await resp.json()
+                attrs = data.get("data", {}).get("attributes", data)
+                cache.set("virustotal", ip, attrs)
+                return {"data": attrs}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Async port scanner (bounded concurrency)
+
+async def scan_ports(ip:str, ports:List[int],concurrency:int=PORTSCAN_CONCURRENCY,timeout:float=PORTSCAN_TIMEOUT)->List[int]:
+    open_ports=[]
+    sem=asyncio.Semaphore(concurrency)
+
+    async def probe(p):
+        try:
+            await sem.acquire()
+            try:
+                fut = asyncio.open_connection(host=ip, port=p)
+                reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+                open_ports.append(p)
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            finally:
+                sem.release()
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            return
+        except Exception:
+            return
+
+    tasks=[asyncio.create_task(probe(p))for p in ports]
+    await  asyncio.gather(*tasks)
+    return sorted(open_ports)
