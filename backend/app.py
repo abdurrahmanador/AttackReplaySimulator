@@ -22,6 +22,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Re
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from websockets import broadcast
 
 load_dotenv()
 
@@ -140,6 +141,7 @@ class Broadcaster:
             for s in stale:
                 if s in self._connections:
                     self._connections.remove(s)
+broadcaster = Broadcaster()
 
 #GeoIP helper
 geo_reader=None
@@ -250,3 +252,185 @@ async def scan_ports(ip:str, ports:List[int],concurrency:int=PORTSCAN_CONCURRENC
     tasks=[asyncio.create_task(probe(p))for p in ports]
     await  asyncio.gather(*tasks)
     return sorted(open_ports)
+
+#Detector(sync/async wrapper)
+def make_event(event_type:str,src_ip:str,raw_line:str,severity:"medium")->Dict[str, Any]:
+    return {
+        "event_id": f"{int(time.time()*1000)}_{os.urandom(2).hex()}",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "src_ip": src_ip,
+        "attack_type": event_type,
+        "severity": severity,
+        "raw": raw_line,
+        "enriched": None
+    }
+
+async def enrich_and_scan(event:Dict[str, Any]) :
+    ip = event.get("src_ip")
+    if not ip:
+        return
+
+    #1) geo lookup
+    geo=await geo_lookup(ip)
+    event_enrich={"geo":geo}
+
+    #2) provider checks concurrently
+    tasks=[]
+    if ABUSEIPDB_KEY:
+        tasks.append(("abuseipdb", abuseipdb_check(ip)))
+    else:
+        tasks.append(("abuseipdb", asyncio.sleep(0, result={"skipped": True, "reason": "no-key"})))
+    if VIRUSTOTAL_KEY:
+        tasks.append(("virustotal", virustotal_check(ip)))
+    else:
+        tasks.append(("virustotal", asyncio.sleep(0, result={"skipped": True, "reason": "no-key"})))
+
+    #run tasks concurrently:
+    provider_results= {}
+
+    for name,coro in tasks:
+        try:
+            res=await coro if asyncio.iscoroutine(coro) else coro
+        except Exception as e:
+            res = {"error": str(e)}
+        provider_results[name] = res
+    event_enrich["providers"]=provider_results
+
+    #port scan
+    open_ports=await scan_ports(ip, PORTSCAN_PORTS)
+    event_enrich["open_ports"]=open_ports
+
+    #attach and broadcast
+    event["enriched"]=event_enrich
+    await broadcaster.broadcast({"type": "event:update", "event": event})
+
+#log tailer
+async def tail_file_and_detect(path:str,poll_interval:float=0.5):
+    """
+       Tail a file and detect events line by line.
+       If file doesn't exist, the function will return.
+    """
+
+    if not os.path.isfile(path):
+        print(f"[tailer] log file not found: {path}")
+        return
+    print(f"[tailer] starting tail on {path}")
+
+    with open(path,"r",encoding="utf-8",errors="replace") as f:
+        f.seek(0,os.SEEK_END)
+        while True:
+            line=f.readline()
+            if not line:
+                await asyncio.sleep(poll_interval)
+                continue
+            line =line.strip()
+
+            #detect pattern
+            #1) Failed SSH login
+            m=PAT_FAILED_LOGIN.search(line)
+            if m:
+                ip=m.group(1)
+                ev=make_event("Failed SSH Login",ip,line,severity="high")
+                asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
+                asyncio.create_task(enrich_and_scan(ev))
+                continue
+
+            #2) SQLi heuristic
+            if PAT_SQLI.search(line):
+                ip_m=PAT_IP.search(line)
+                ip=ip_m.group(1) if ip_m else None
+                ev = make_event("SQL Injection Attempt", ip or "unknown", line, severity="critical")
+                asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
+                if ip:
+                    asyncio.create_task(enrich_and_scan(ev))
+                continue
+
+            #3) Admin panel probe
+            if PAT_ADMIN_PANEL.search(line):
+                ip_m = PAT_IP.search(line)
+                ip = ip_m.group(1) if ip_m else None
+                ev = make_event("Admin Panel Probe", ip or "unknown", line, severity="medium")
+                asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
+                if ip:
+                    asyncio.create_task(enrich_and_scan(ev))
+                continue
+
+            # 4) port-scan hint strings
+            if PAT_PORT_SCAN_HINT.search(line):
+                ip_m = PAT_IP.search(line)
+                ip = ip_m.group(1) if ip_m else None
+                ev = make_event("Port Scan Detected", ip or "unknown", line, severity="low")
+                asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
+                if ip:
+                    asyncio.create_task(enrich_and_scan(ev))
+                continue
+
+#fastapi endpoints
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+
+@app.websocket("/ws/events")
+async def ws_endpoint(ws:WebSocket):
+    await broadcaster.connect(ws)
+    try:
+        while True:
+            msg=await ws.receive_text()
+            await ws.send_text(json.dumps({"type": "server:echo", "msg": msg}))
+    except WebSocketDisconnect:
+        await broadcaster.disconnect(ws)
+
+    except Exception:
+        await broadcaster.disconnect(ws)
+@app.on_event("startup")
+async def start_tasks():
+    await startup_event()
+
+@app.post("/ingest")
+async def ingest_log(request: Request, background: BackgroundTasks):
+    """
+    Accept POSTed log lines as JSON: {"line": "..."}
+    Useful for LogSentry or other forwarders to push lines into detection.
+    """
+    body = await request.json()
+    line = body.get("line")
+    if not line:
+        raise HTTPException(status_code=400, detail="missing 'line' in JSON")
+    line = line.strip()
+    m = PAT_FAILED_LOGIN.search(line)
+    if m:
+        ip = m.group(1)
+        ev = make_event("Failed SSH Login", ip, line, severity="high")
+        # broadcast immediately
+        await broadcaster.broadcast({"type": "event:new", "event": ev})
+        background.add_task(enrich_and_scan, ev)
+        return JSONResponse({"status": "detected", "event": ev})
+    if PAT_SQLI.search(line):
+        ip_m = PAT_IP.search(line)
+        ip = ip_m.group(1) if ip_m else None
+        ev = make_event("SQL Injection Attempt", ip or "unknown", line, severity="critical")
+        await broadcaster.broadcast({"type": "event:new", "event": ev})
+        if ip:
+            background.add_task(enrich_and_scan, ev)
+        return JSONResponse({"status": "detected", "event": ev})
+    if PAT_ADMIN_PANEL.search(line):
+        ip_m = PAT_IP.search(line)
+        ip = ip_m.group(1) if ip_m else None
+        ev = make_event("Admin Panel Probe", ip or "unknown", line, severity="medium")
+        await broadcaster.broadcast({"type": "event:new", "event": ev})
+        if ip:
+            background.add_task(enrich_and_scan, ev)
+        return JSONResponse({"status": "detected", "event": ev})
+
+    # else: nothing suspicious
+    return JSONResponse({"status": "ok", "msg": "no rule matched"})
+
+#Startup tasks:
+async def startup_event():
+    loop = asyncio.get_event_loop()
+    if os.path.exists(LOG_FILE):
+        print(f"[startup] launching tailer for {LOG_FILE}")
+        loop.create_task(tail_file_and_detect(LOG_FILE))
+    else:
+        print(f"[startup] LOG_FILE env {LOG_FILE} not found; run generator or create a log file for demo")
