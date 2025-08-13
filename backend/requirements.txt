@@ -1,5 +1,0 @@
-fastapi
-uvicorn[standard]
-aiohttp
-geoip2
-python-dotenv
