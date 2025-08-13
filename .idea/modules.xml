@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/AttackReplaySimulator.iml" filepath="$PROJECT_DIR$/.idea/AttackReplaySimulator.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/CyberAttackLive.iml" filepath="$PROJECT_DIR$/.idea/CyberAttackLive.iml" />
     </modules>
   </component>
 </project>
