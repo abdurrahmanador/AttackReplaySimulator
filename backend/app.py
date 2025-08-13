@@ -10,51 +10,50 @@ import json
 import time
 import sqlite3
 import asyncio
-from asyncio import gather
-from functools import cache
-from http.client import responses
-
-import aiohttp
-import socket
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+
+import aiohttp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from websockets import broadcast
 
-load_dotenv()
-
+# Optional GeoIP (MaxMind). If not installed or no DB, we fallback to ip-api.com
 try:
     import geoip2.database as geoip2_db
 except Exception:
-    geoip2_db=None
+    geoip2_db = None
 
+load_dotenv()
 
-#config
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_KEY")
 VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_KEY")
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH")
 CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "intelsentry_cache.db")
-LOG_FILE=os.getenv("LOG_FILE","sample.log")
-PORT=int(os.getenv("PORT",8000))
+LOG_FILE = os.getenv("LOG_FILE", "sample.log")
+PORT = int(os.getenv("PORT", 8000))
 
-#Runtime tuning
-CACHE_TTL_SECONDS=int(os.getenv("CACHE_TTL_SECONDS",24*3600))
-PORTSCAN_CONCURRENCY=int(os.getenv("PORTSCAN_CONCURRENCY",200))
-PORTSCAN_TIMEOUT=float(os.getenv("PORTSCAN_TIMEOUT",1.0))
+# Runtime tuning
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(24 * 3600)))
+PORTSCAN_CONCURRENCY = int(os.getenv("PORTSCAN_CONCURRENCY", "200"))
+PORTSCAN_TIMEOUT = float(os.getenv("PORTSCAN_TIMEOUT", "1.0"))
 PORTSCAN_PORTS = [22, 80, 443, 3306, 8080, 3389, 5900, 21, 25]
 
-#REGEX Detection rules
+# REGEX Detection rules
 PAT_FAILED_LOGIN = re.compile(r"Failed password for .* from (\d{1,3}(?:\.\d{1,3}){3})")
 PAT_SQLI = re.compile(r"(%27|\'|--|%23|#|\bunion\b|\bselect\b)", re.IGNORECASE)
 PAT_ADMIN_PANEL = re.compile(r"(\/wp-admin|\/wp-login\.php|\/admin\b)", re.IGNORECASE)
 PAT_IP = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})")
 PAT_PORT_SCAN_HINT = re.compile(r"nmap|scan|SYN Scan|masscan", re.IGNORECASE)
 
-#fastapi app+CORS
-app=FastAPI(title="AttackReplay Backend")
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title="AttackReplay Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,96 +61,119 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-#SQLite Cache class
+# -----------------------------------------------------------------------------
+# SQLite Cache
+# -----------------------------------------------------------------------------
 class CacheDB:
-
-    def __init__(self, path:str=CACHE_DB_PATH):
-        self.path = CACHE_DB_PATH
+    def __init__(self, path: str = CACHE_DB_PATH):
+        self.path = path
         self._ensure_schema()
 
     def _conn(self):
         return sqlite3.connect(self.path)
 
     def _ensure_schema(self):
-        conn=self._conn()
-        cur=conn.cursor()
+        conn = self._conn()
+        cur = conn.cursor()
         cur.execute("""
         CREATE TABLE IF NOT EXISTS cache(
-        provider TEXT NOT NULL,
-        key TEXT NOT NULL,
-        response TEXT,
-        ts INTEGER,
-        PRIMARY KEY(provider, key)
+          provider TEXT NOT NULL,
+          key TEXT NOT NULL,
+          response TEXT,
+          ts INTEGER,
+          PRIMARY KEY(provider, key)
         );
         """)
         conn.commit()
         conn.close()
 
-    def get(self,provider,key,ttl_seconds:str=CACHE_TTL_SECONDS)->Optional[Dict[str,any]]:
-        conn=self._conn()
-        cur=conn.cursor()
+    def get(self, provider: str, key: str, ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[Dict[str, Any]]:
+        conn = self._conn()
+        cur = conn.cursor()
         cur.execute("SELECT response, ts FROM cache WHERE provider=? AND key=?", (provider, key))
-        row=cur.fetchone()
+        row = cur.fetchone()
         conn.close()
         if row:
-            response_json,ts=row
-            if (time.time()-ts)<=ttl_seconds:
+            response_json, ts = row
+            if (time.time() - ts) <= ttl_seconds:
                 try:
                     return json.loads(response_json)
                 except Exception:
                     return None
-
         return None
 
-    def set(self,provider,key,obj:Dict[str,any]):
-        conn=self._conn()
-        cur=conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO cache(provider, key, response, ts) VALUES (?, ?, ?, ?)",
-                    (provider, key, json.dumps(obj, ensure_ascii=False), int(time.time())))
+    def set(self, provider: str, key: str, obj: Dict[str, Any]):
+        conn = self._conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR REPLACE INTO cache(provider, key, response, ts) VALUES (?, ?, ?, ?)",
+            (provider, key, json.dumps(obj, ensure_ascii=False), int(time.time()))
+        )
         conn.commit()
         conn.close()
 
-#Websocket Manager
+cache_db = CacheDB()
+
+# -----------------------------------------------------------------------------
+# WebSocket Broadcaster
+# -----------------------------------------------------------------------------
+
 class Broadcaster:
-
     def __init__(self):
-        self._connections:List[WebSocket]=[]
-        self.lock=asyncio.Lock()
+        self._connections: List[WebSocket] = []
+        self.lock = asyncio.Lock()
 
-    async def connect(self,ws:WebSocket):
+    async def connect(self, ws: WebSocket):
         await ws.accept()
         async with self.lock:
             self._connections.append(ws)
+        print(f"✅ WebSocket connected! Total clients: {len(self._connections)}")
 
-    async def disconnect(self,ws:WebSocket):
+    async def disconnect(self, ws: WebSocket):
         async with self.lock:
             if ws in self._connections:
                 self._connections.remove(ws)
+        print(f"🔌 WebSocket disconnected! Remaining: {len(self._connections)}")
 
-    async def broadcast(self,message:Dict[str,any]):
-        payload=json.dumps(message,default=str)
+    async def broadcast(self, message: Dict[str, Any]):
+        payload = json.dumps(message, default=str)
+        print(f"📢 Broadcasting to {len(self._connections)} clients: {message.get('type')}")
+
+        if len(self._connections) == 0:
+            print("⚠️ No clients connected!")
+            return
+
         async with self.lock:
-            stale=[]
+            stale = []
             for ws in list(self._connections):
                 try:
                     await ws.send_text(payload)
-                except Exception:
+                    print(f"✅ Message sent successfully")
+                except Exception as e:
+                    print(f"❌ Failed to send: {e}")
                     stale.append(ws)
+
             for s in stale:
                 if s in self._connections:
                     self._connections.remove(s)
+
+
 broadcaster = Broadcaster()
 
-#GeoIP helper
-geo_reader=None
+
+
+# -----------------------------------------------------------------------------
+# GeoIP helper
+# -----------------------------------------------------------------------------
+geo_reader = None
 if GEOIP_DB_PATH and geoip2_db:
     try:
-        geo_reader=geoip2_db.Reader(GEOIP_DB_PATH)
+        geo_reader = geoip2_db.Reader(GEOIP_DB_PATH)
     except Exception:
-        geo_reader=None
+        geo_reader = None
 
-async def geo_lookup(ip:str)->Dict[str,any]:
+async def geo_lookup(ip: str) -> Dict[str, Any]:
+    # Try local MaxMind DB first
     if geo_reader:
         try:
             r = geo_reader.city(ip)
@@ -159,11 +181,11 @@ async def geo_lookup(ip:str)->Dict[str,any]:
             city = r.city.name or ""
             lat = getattr(r.location, "latitude", None)
             lon = getattr(r.location, "longitude", None)
-            isp = ""  # MaxMind ASN DB needed for ASN/ISP, skip if not present
-            return {"country": country, "city": city, "lat": lat, "lon": lon, "org": isp}
+            return {"country": country, "city": city, "lat": lat, "lon": lon, "org": ""}
         except Exception:
             pass
 
+    # Fallback to ip-api.com
     try:
         url = f"http://ip-api.com/json/{ip}?fields=status,country,city,lat,lon,org,message"
         async with aiohttp.ClientSession() as session:
@@ -171,21 +193,28 @@ async def geo_lookup(ip:str)->Dict[str,any]:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("status") == "success":
-                        return {"country": data.get("country"), "city": data.get("city"),
-                                "lat": data.get("lat"), "lon": data.get("lon"), "org": data.get("org")}
+                        return {
+                            "country": data.get("country"),
+                            "city": data.get("city"),
+                            "lat": data.get("lat"),
+                            "lon": data.get("lon"),
+                            "org": data.get("org"),
+                        }
     except Exception:
         pass
 
     return {"country": None, "city": None, "lat": None, "lon": None, "org": None}
 
-#HTTP adapters for providers
+# -----------------------------------------------------------------------------
+# Provider Lookups
+# -----------------------------------------------------------------------------
 async def abuseipdb_check(ip: str) -> Dict[str, Any]:
-    """Return AbuseIPDB 'data' dict or error dict. Requires ABUSEIPDB_KEY env var."""
     if not ABUSEIPDB_KEY:
         return {"skipped": True, "reason": "no-abuseipdb-key"}
-    cached = cache.get("abuseipdb", ip)
+    cached = cache_db.get("abuseipdb", ip)
     if cached:
         return {"cached": True, "data": cached}
+
     url = "https://api.abuseipdb.com/api/v2/check"
     headers = {"Key": ABUSEIPDB_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": "90"}
@@ -197,18 +226,18 @@ async def abuseipdb_check(ip: str) -> Dict[str, Any]:
                     return {"error": f"http_{resp.status}", "body": text}
                 data = await resp.json()
                 d = data.get("data", data)
-                cache.set("abuseipdb", ip, d)
+                cache_db.set("abuseipdb", ip, d)
                 return {"data": d}
     except Exception as e:
         return {"error": str(e)}
 
 async def virustotal_check(ip: str) -> Dict[str, Any]:
-    """Return VirusTotal v3 ip attributes or error dict. Requires VIRUSTOTAL_KEY env var."""
     if not VIRUSTOTAL_KEY:
         return {"skipped": True, "reason": "no-virustotal-key"}
-    cached = cache.get("virustotal", ip)
+    cached = cache_db.get("virustotal", ip)
     if cached:
         return {"cached": True, "data": cached}
+
     url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
     headers = {"x-apikey": VIRUSTOTAL_KEY}
     try:
@@ -219,18 +248,21 @@ async def virustotal_check(ip: str) -> Dict[str, Any]:
                     return {"error": f"http_{resp.status}", "body": text}
                 data = await resp.json()
                 attrs = data.get("data", {}).get("attributes", data)
-                cache.set("virustotal", ip, attrs)
+                cache_db.set("virustotal", ip, attrs)
                 return {"data": attrs}
     except Exception as e:
         return {"error": str(e)}
 
+# -----------------------------------------------------------------------------
 # Async port scanner (bounded concurrency)
+# -----------------------------------------------------------------------------
+async def scan_ports(ip: str, ports: List[int],
+                     concurrency: int = PORTSCAN_CONCURRENCY,
+                     timeout: float = PORTSCAN_TIMEOUT) -> List[int]:
+    open_ports: List[int] = []
+    sem = asyncio.Semaphore(concurrency)
 
-async def scan_ports(ip:str, ports:List[int],concurrency:int=PORTSCAN_CONCURRENCY,timeout:float=PORTSCAN_TIMEOUT)->List[int]:
-    open_ports=[]
-    sem=asyncio.Semaphore(concurrency)
-
-    async def probe(p):
+    async def probe(p: int):
         try:
             await sem.acquire()
             try:
@@ -249,12 +281,14 @@ async def scan_ports(ip:str, ports:List[int],concurrency:int=PORTSCAN_CONCURRENC
         except Exception:
             return
 
-    tasks=[asyncio.create_task(probe(p))for p in ports]
-    await  asyncio.gather(*tasks)
+    tasks = [asyncio.create_task(probe(p)) for p in ports]
+    await asyncio.gather(*tasks)
     return sorted(open_ports)
 
-#Detector(sync/async wrapper)
-def make_event(event_type:str,src_ip:str,raw_line:str,severity:"medium")->Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Event helpers
+# -----------------------------------------------------------------------------
+def make_event(event_type: str, src_ip: str, raw_line: str, severity: str = "medium") -> Dict[str, Any]:
     return {
         "event_id": f"{int(time.time()*1000)}_{os.urandom(2).hex()}",
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -262,175 +296,198 @@ def make_event(event_type:str,src_ip:str,raw_line:str,severity:"medium")->Dict[s
         "attack_type": event_type,
         "severity": severity,
         "raw": raw_line,
-        "enriched": None
+        "enriched": None,
     }
 
-async def enrich_and_scan(event:Dict[str, Any]) :
+async def enrich_and_scan(event: Dict[str, Any]):
     ip = event.get("src_ip")
-    if not ip:
+    if not ip or ip == "unknown":
         return
 
-    #1) geo lookup
-    geo=await geo_lookup(ip)
-    event_enrich={"geo":geo}
+    # 1) geo lookup
+    geo = await geo_lookup(ip)
+    event_enrich: Dict[str, Any] = {"geo": geo}
 
-    #2) provider checks concurrently
-    tasks=[]
+    # 2) provider checks concurrently
+    tasks = []
     if ABUSEIPDB_KEY:
-        tasks.append(("abuseipdb", abuseipdb_check(ip)))
+        tasks.append(asyncio.create_task(abuseipdb_check(ip)))
     else:
-        tasks.append(("abuseipdb", asyncio.sleep(0, result={"skipped": True, "reason": "no-key"})))
+        event_enrich.setdefault("providers", {})["abuseipdb"] = {"skipped": True, "reason": "no-key"}
+
     if VIRUSTOTAL_KEY:
-        tasks.append(("virustotal", virustotal_check(ip)))
+        tasks.append(asyncio.create_task(virustotal_check(ip)))
     else:
-        tasks.append(("virustotal", asyncio.sleep(0, result={"skipped": True, "reason": "no-key"})))
+        event_enrich.setdefault("providers", {})["virustotal"] = {"skipped": True, "reason": "no-key"}
 
-    #run tasks concurrently:
-    provider_results= {}
+    provider_results = {}
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Assign results into dict in fixed order
+        # We can figure names by tasks length consistency
+        idx = 0
+        if ABUSEIPDB_KEY:
+            provider_results["abuseipdb"] = results[idx] if not isinstance(results[idx], Exception) else {"error": str(results[idx])}
+            idx += 1
+        if VIRUSTOTAL_KEY:
+            provider_results["virustotal"] = results[idx] if not isinstance(results[idx], Exception) else {"error": str(results[idx])}
+    # merge any preset skipped
+    existing_providers = event_enrich.get("providers", {})
+    provider_results = {**existing_providers, **provider_results}
+    event_enrich["providers"] = provider_results
 
-    for name,coro in tasks:
-        try:
-            res=await coro if asyncio.iscoroutine(coro) else coro
-        except Exception as e:
-            res = {"error": str(e)}
-        provider_results[name] = res
-    event_enrich["providers"]=provider_results
+    # 3) port scan
+    try:
+        open_ports = await scan_ports(ip, PORTSCAN_PORTS)
+    except Exception:
+        open_ports = []
+    event_enrich["open_ports"] = open_ports
 
-    #port scan
-    open_ports=await scan_ports(ip, PORTSCAN_PORTS)
-    event_enrich["open_ports"]=open_ports
-
-    #attach and broadcast
-    event["enriched"]=event_enrich
+    # 4) attach & broadcast update
+    event["enriched"] = event_enrich
     await broadcaster.broadcast({"type": "event:update", "event": event})
 
-#log tailer
-async def tail_file_and_detect(path:str,poll_interval:float=0.5):
-    """
-       Tail a file and detect events line by line.
-       If file doesn't exist, the function will return.
-    """
-
+# -----------------------------------------------------------------------------
+# Log tailer and detection
+# -----------------------------------------------------------------------------
+async def tail_file_and_detect(path: str, poll_interval: float = 0.5):
     if not os.path.isfile(path):
         print(f"[tailer] log file not found: {path}")
         return
     print(f"[tailer] starting tail on {path}")
 
-    with open(path,"r",encoding="utf-8",errors="replace") as f:
-        f.seek(0,os.SEEK_END)
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(0, os.SEEK_END)
         while True:
-            line=f.readline()
+            line = f.readline()
             if not line:
                 await asyncio.sleep(poll_interval)
                 continue
-            line =line.strip()
+            line = line.strip()
 
-            #detect pattern
-            #1) Failed SSH login
-            m=PAT_FAILED_LOGIN.search(line)
+            # 1) Failed SSH login
+            m = PAT_FAILED_LOGIN.search(line)
             if m:
-                ip=m.group(1)
-                ev=make_event("Failed SSH Login",ip,line,severity="high")
+                ip = m.group(1)
+                ev = make_event("Failed SSH Login", ip, line, severity="high")
                 asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
                 asyncio.create_task(enrich_and_scan(ev))
                 continue
 
-            #2) SQLi heuristic
+            # 2) SQLi heuristic
             if PAT_SQLI.search(line):
-                ip_m=PAT_IP.search(line)
-                ip=ip_m.group(1) if ip_m else None
-                ev = make_event("SQL Injection Attempt", ip or "unknown", line, severity="critical")
+                ip_m = PAT_IP.search(line)
+                ip = ip_m.group(1) if ip_m else "unknown"
+                ev = make_event("SQL Injection Attempt", ip, line, severity="critical")
                 asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
-                if ip:
+                if ip != "unknown":
                     asyncio.create_task(enrich_and_scan(ev))
                 continue
 
-            #3) Admin panel probe
+            # 3) Admin panel probe
             if PAT_ADMIN_PANEL.search(line):
                 ip_m = PAT_IP.search(line)
-                ip = ip_m.group(1) if ip_m else None
-                ev = make_event("Admin Panel Probe", ip or "unknown", line, severity="medium")
+                ip = ip_m.group(1) if ip_m else "unknown"
+                ev = make_event("Admin Panel Probe", ip, line, severity="medium")
                 asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
-                if ip:
+                if ip != "unknown":
                     asyncio.create_task(enrich_and_scan(ev))
                 continue
 
-            # 4) port-scan hint strings
+            # 4) Port-scan hint strings
             if PAT_PORT_SCAN_HINT.search(line):
                 ip_m = PAT_IP.search(line)
-                ip = ip_m.group(1) if ip_m else None
-                ev = make_event("Port Scan Detected", ip or "unknown", line, severity="low")
+                ip = ip_m.group(1) if ip_m else "unknown"
+                ev = make_event("Port Scan Detected", ip, line, severity="low")
                 asyncio.create_task(broadcaster.broadcast({"type": "event:new", "event": ev}))
-                if ip:
+                if ip != "unknown":
                     asyncio.create_task(enrich_and_scan(ev))
                 continue
 
-#fastapi endpoints
-
+# -----------------------------------------------------------------------------
+# FastAPI endpoints
+# -----------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
+
 @app.websocket("/ws/events")
-async def ws_endpoint(ws:WebSocket):
+async def ws_endpoint(ws: WebSocket):
+    print(f"🔗 New WebSocket connection attempt!")
     await broadcaster.connect(ws)
+
     try:
         while True:
-            msg=await ws.receive_text()
+            msg = await ws.receive_text()
+            print(f"📨 Received: {msg}")
             await ws.send_text(json.dumps({"type": "server:echo", "msg": msg}))
     except WebSocketDisconnect:
+        print("🔌 Client disconnected normally")
+        await broadcaster.disconnect(ws)
+    except Exception as e:
+        print(f"❌ WebSocket error: {e}")
         await broadcaster.disconnect(ws)
 
-    except Exception:
-        await broadcaster.disconnect(ws)
-@app.on_event("startup")
-async def start_tasks():
-    await startup_event()
 
 @app.post("/ingest")
 async def ingest_log(request: Request, background: BackgroundTasks):
     """
     Accept POSTed log lines as JSON: {"line": "..."}
-    Useful for LogSentry or other forwarders to push lines into detection.
     """
-    body = await request.json()
-    line = body.get("line")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    line = (body.get("line") or "").strip()
     if not line:
         raise HTTPException(status_code=400, detail="missing 'line' in JSON")
-    line = line.strip()
+
     m = PAT_FAILED_LOGIN.search(line)
     if m:
         ip = m.group(1)
         ev = make_event("Failed SSH Login", ip, line, severity="high")
-        # broadcast immediately
         await broadcaster.broadcast({"type": "event:new", "event": ev})
         background.add_task(enrich_and_scan, ev)
         return JSONResponse({"status": "detected", "event": ev})
+
     if PAT_SQLI.search(line):
         ip_m = PAT_IP.search(line)
-        ip = ip_m.group(1) if ip_m else None
-        ev = make_event("SQL Injection Attempt", ip or "unknown", line, severity="critical")
+        ip = ip_m.group(1) if ip_m else "unknown"
+        ev = make_event("SQL Injection Attempt", ip, line, severity="critical")
         await broadcaster.broadcast({"type": "event:new", "event": ev})
-        if ip:
+        if ip != "unknown":
             background.add_task(enrich_and_scan, ev)
         return JSONResponse({"status": "detected", "event": ev})
+
     if PAT_ADMIN_PANEL.search(line):
         ip_m = PAT_IP.search(line)
-        ip = ip_m.group(1) if ip_m else None
-        ev = make_event("Admin Panel Probe", ip or "unknown", line, severity="medium")
+        ip = ip_m.group(1) if ip_m else "unknown"
+        ev = make_event("Admin Panel Probe", ip, line, severity="medium")
         await broadcaster.broadcast({"type": "event:new", "event": ev})
-        if ip:
+        if ip != "unknown":
             background.add_task(enrich_and_scan, ev)
         return JSONResponse({"status": "detected", "event": ev})
 
-    # else: nothing suspicious
+    if PAT_PORT_SCAN_HINT.search(line):
+        ip_m = PAT_IP.search(line)
+        ip = ip_m.group(1) if ip_m else "unknown"
+        ev = make_event("Port Scan Detected", ip, line, severity="low")
+        await broadcaster.broadcast({"type": "event:new", "event": ev})
+        if ip != "unknown":
+            background.add_task(enrich_and_scan, ev)
+        return JSONResponse({"status": "detected", "event": ev})
+
     return JSONResponse({"status": "ok", "msg": "no rule matched"})
 
-#Startup tasks:
-async def startup_event():
-    loop = asyncio.get_event_loop()
+# -----------------------------------------------------------------------------
+# Startup
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+async def on_startup():
     if os.path.exists(LOG_FILE):
         print(f"[startup] launching tailer for {LOG_FILE}")
-        loop.create_task(tail_file_and_detect(LOG_FILE))
+        asyncio.create_task(tail_file_and_detect(LOG_FILE))
     else:
-        print(f"[startup] LOG_FILE env {LOG_FILE} not found; run generator or create a log file for demo")
+        print(f"[startup] LOG_FILE {LOG_FILE} not found; use /ingest to send lines for demo.")
